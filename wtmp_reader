@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+wtmp_reader.py - Parse Linux wtmp/utmp/btmp files on Windows (or anywhere).
+
+Reads binary login records pulled from a Unix/Linux system and prints them
+in a readable form, with selectable timezone or raw epoch timestamps.
+
+Examples:
+    python wtmp_reader.py wtmp
+    python wtmp_reader.py wtmp --tz UTC
+    python wtmp_reader.py wtmp --tz America/New_York
+    python wtmp_reader.py wtmp --tz EST            (shortcut, DST-aware)
+    python wtmp_reader.py wtmp --tz +05:30         (fixed UTC offset)
+    python wtmp_reader.py wtmp --tz epoch          (raw Unix timestamps)
+    python wtmp_reader.py wtmp --tz local          (this PC's timezone)
+    python wtmp_reader.py wtmp -o report.csv --format csv
+    python wtmp_reader.py wtmp --list-timezones
+
+Named IANA zones (e.g. "Europe/London") need the tzdata package on Windows:
+    pip install tzdata
+UTC, epoch, local and fixed offsets (+HH:MM) work without it.
+"""
+
+import argparse
+import csv
+import io
+import ipaddress
+import json
+import re
+import struct
+import sys
+from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+# Record layout (glibc struct utmp on x86 / x86_64 / ARM / most Linux): 384 bytes
+#   short  ut_type        + 2 bytes padding
+#   int    ut_pid
+#   char   ut_line[32]
+#   char   ut_id[4]
+#   char   ut_user[32]
+#   char   ut_host[256]
+#   short  e_termination, e_exit
+#   int32  ut_session
+#   int32  tv_sec, tv_usec
+#   int32  ut_addr_v6[4]
+#   char   __unused[20]
+# ---------------------------------------------------------------------------
+RECORD_FMT = "hhi32s4s32s256shhiii16s20s"
+RECORD_SIZE = struct.calcsize("<" + RECORD_FMT)  # 384
+
+UT_TYPES = {
+    0: "EMPTY",
+    1: "RUN_LVL",
+    2: "BOOT_TIME",
+    3: "NEW_TIME",
+    4: "OLD_TIME",
+    5: "INIT_PROCESS",
+    6: "LOGIN_PROCESS",
+    7: "USER_PROCESS",
+    8: "DEAD_PROCESS",
+    9: "ACCOUNTING",
+}
+
+# Convenience aliases -> IANA zone names (DST handled automatically).
+TZ_ALIASES = {
+    "UTC": "UTC",
+    "GMT": "UTC",
+    "Z": "UTC",
+    "EST": "America/New_York",
+    "EDT": "America/New_York",
+    "ET": "America/New_York",
+    "CST": "America/Chicago",
+    "CDT": "America/Chicago",
+    "CT": "America/Chicago",
+    "MST": "America/Denver",
+    "MDT": "America/Denver",
+    "MT": "America/Denver",
+    "AZ": "America/Phoenix",
+    "PST": "America/Los_Angeles",
+    "PDT": "America/Los_Angeles",
+    "PT": "America/Los_Angeles",
+    "AKST": "America/Anchorage",
+    "HST": "Pacific/Honolulu",
+    "BST": "Europe/London",
+    "UK": "Europe/London",
+    "CET": "Europe/Paris",
+    "CEST": "Europe/Paris",
+    "EET": "Europe/Athens",
+    "MSK": "Europe/Moscow",
+    "IST": "Asia/Kolkata",
+    "SGT": "Asia/Singapore",
+    "CST-CN": "Asia/Shanghai",
+    "HKT": "Asia/Hong_Kong",
+    "JST": "Asia/Tokyo",
+    "KST": "Asia/Seoul",
+    "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",
+    "AWST": "Australia/Perth",
+    "NZST": "Pacific/Auckland",
+}
+
+# Fixed offsets used if tzdata isn't installed (no DST adjustment).
+TZ_FALLBACK_OFFSETS = {
+    "America/New_York": -5, "America/Chicago": -6, "America/Denver": -7,
+    "America/Phoenix": -7, "America/Los_Angeles": -8, "America/Anchorage": -9,
+    "Pacific/Honolulu": -10, "Europe/London": 0, "Europe/Paris": 1,
+    "Europe/Athens": 2, "Europe/Moscow": 3, "Asia/Kolkata": 5.5,
+    "Asia/Singapore": 8, "Asia/Shanghai": 8, "Asia/Hong_Kong": 8,
+    "Asia/Tokyo": 9, "Asia/Seoul": 9, "Australia/Sydney": 10,
+    "Australia/Perth": 8, "Pacific/Auckland": 12,
+}
+
+
+# ---------------------------------------------------------------------------
+# Timezone handling
+# ---------------------------------------------------------------------------
+def resolve_timezone(name):
+    """Return a tzinfo, or the string 'epoch'. Exits with a message on error."""
+    raw = name.strip()
+    key = raw.upper()
+
+    if key in ("EPOCH", "UNIX", "RAW"):
+        return "epoch"
+    if key == "LOCAL":
+        return datetime.now().astimezone().tzinfo
+
+    # Fixed offset: +05:30, -0800, UTC+2, GMT-3:30
+    m = re.fullmatch(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", key)
+    if m:
+        sign = 1 if m.group(1) == "+" else -1
+        hours, mins = int(m.group(2)), int(m.group(3) or 0)
+        if hours > 14 or mins > 59:
+            sys.exit(f"error: invalid UTC offset '{raw}'")
+        return timezone(sign * timedelta(hours=hours, minutes=mins))
+
+    zone_name = TZ_ALIASES.get(key, raw)
+    if zone_name == "UTC":
+        return timezone.utc
+
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except ImportError:  # Python < 3.9
+        ZoneInfo = None
+
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+
+    if zone_name in TZ_FALLBACK_OFFSETS:
+        offset = TZ_FALLBACK_OFFSETS[zone_name]
+        print(
+            f"warning: tz database not available, using fixed UTC{offset:+g} for "
+            f"'{raw}' (no DST). Run 'pip install tzdata' for accurate results.",
+            file=sys.stderr,
+        )
+        return timezone(timedelta(hours=offset), name=raw.upper())
+
+    sys.exit(
+        f"error: unknown timezone '{raw}'. Use an IANA name like 'Europe/London', "
+        f"an offset like '+05:30', 'UTC', 'local' or 'epoch'.\n"
+        f"(On Windows, IANA names need: pip install tzdata)"
+    )
+
+
+def format_time(sec, usec, tz, show_usec):
+    if tz == "epoch":
+        return f"{sec}.{usec:06d}" if show_usec else str(sec)
+    try:
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(tz)
+    except (OverflowError, OSError, ValueError):
+        return f"INVALID({sec})"
+    fmt = "%Y-%m-%d %H:%M:%S"
+    out = dt.strftime(fmt)
+    if show_usec:
+        out += f".{usec:06d}"
+    return out + " " + (dt.strftime("%Z") or dt.strftime("%z"))
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+def cstr(b):
+    return b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+
+def decode_addr(raw):
+    words = raw
+    if words == b"\x00" * 16:
+        return ""
+    # If only the first 4 bytes are set it's IPv4, otherwise IPv6.
+    if words[4:] == b"\x00" * 12:
+        return str(ipaddress.IPv4Address(words[:4]))
+    return str(ipaddress.IPv6Address(words))
+
+
+def detect_endian(data):
+    """Guess byte order by checking that ut_type values look sane."""
+    scores = {}
+    n = min(len(data) // RECORD_SIZE, 200)
+    for e in ("<", ">"):
+        ok = 0
+        for i in range(n):
+            ut_type = struct.unpack_from(e + "h", data, i * RECORD_SIZE)[0]
+            if 0 <= ut_type <= 9:
+                ok += 1
+        scores[e] = ok
+    return "<" if scores["<"] >= scores[">"] else ">"
+
+
+def parse_wtmp(data, endian):
+    fmt = endian + RECORD_FMT
+    count = len(data) // RECORD_SIZE
+    for i in range(count):
+        chunk = data[i * RECORD_SIZE:(i + 1) * RECORD_SIZE]
+        (ut_type, _pad, pid, line, ut_id, user, host,
+         e_term, e_exit, session, tv_sec, tv_usec, addr, _unused) = struct.unpack(fmt, chunk)
+        yield {
+            "index": i,
+            "offset": i * RECORD_SIZE,
+            "type_num": ut_type,
+            "type": UT_TYPES.get(ut_type, f"UNKNOWN({ut_type})"),
+            "pid": pid,
+            "line": cstr(line),
+            "id": cstr(ut_id),
+            "user": cstr(user),
+            "host": cstr(host),
+            "exit_termination": e_term,
+            "exit_status": e_exit,
+            "session": session,
+            "tv_sec": tv_sec & 0xFFFFFFFF if tv_sec < 0 else tv_sec,
+            "tv_usec": tv_usec,
+            "addr": decode_addr(addr),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+COLUMNS = ["time", "type", "user", "line", "host", "addr", "pid", "id",
+           "session", "exit_termination", "exit_status", "index", "offset"]
+TEXT_COLUMNS = ["time", "type", "user", "line", "host", "addr", "pid"]
+
+
+def render_text(rows, columns):
+    if not rows:
+        return "No records found.\n"
+    widths = {c: len(c.upper()) for c in columns}
+    for r in rows:
+        for c in columns:
+            widths[c] = min(max(widths[c], len(str(r[c]))), 60)
+    def fmt_row(vals):
+        return "  ".join(str(vals[c])[:60].ljust(widths[c]) for c in columns).rstrip()
+    out = [fmt_row({c: c.upper() for c in columns}),
+           "  ".join("-" * widths[c] for c in columns)]
+    out += [fmt_row(r) for r in rows]
+    return "\n".join(out) + "\n"
+
+
+def render_csv(rows, columns):
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    return buf.getvalue()
+
+
+def render_json(rows, columns):
+    return json.dumps([{c: r[c] for c in columns} for r in rows], indent=2) + "\n"
+
+
+def list_timezones():
+    print("Special values:")
+    print("  epoch        raw Unix timestamp (seconds since 1970-01-01 UTC)")
+    print("  UTC          Coordinated Universal Time (default)")
+    print("  local        this computer's timezone")
+    print("  +HH:MM       fixed offset, e.g. +05:30, -08:00, UTC+2")
+    print("\nShortcuts (DST-aware when tzdata is available):")
+    for k, v in TZ_ALIASES.items():
+        print(f"  {k:<8} -> {v}")
+    print("\nAny IANA zone name also works, e.g. Europe/Berlin, America/Sao_Paulo.")
+    try:
+        import zoneinfo
+        zones = zoneinfo.available_timezones()
+        print(f"({len(zones)} IANA zones available on this system.)"
+              if zones else "(No IANA zones found - run: pip install tzdata)")
+    except ImportError:
+        print("(zoneinfo needs Python 3.9+)")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+HELP_EPILOG = """\
+examples:
+  python wtmp_reader.py wtmp                         print to terminal (UTC)
+  python wtmp_reader.py wtmp --tz epoch              raw Unix timestamps
+  python wtmp_reader.py wtmp --tz EST                US Eastern (DST-aware)
+  python wtmp_reader.py wtmp --tz Europe/London      any IANA zone name
+  python wtmp_reader.py wtmp --tz +05:30             fixed UTC offset
+  python wtmp_reader.py wtmp --tz local              this PC's timezone
+  python wtmp_reader.py wtmp -o report.txt           save as text file
+  python wtmp_reader.py wtmp -o logins.csv           save as CSV (from extension)
+  python wtmp_reader.py wtmp -o out.dat -f json      save as JSON (explicit)
+  python wtmp_reader.py wtmp --type USER_PROCESS     logins only
+  python wtmp_reader.py wtmp --user alice --reverse  one user, newest first
+  python wtmp_reader.py btmp                         failed logins (same format)
+
+timezone values (--tz):
+  epoch | UTC | local | +HH:MM / -HH:MM | shortcuts (EST, PST, CST, MST, IST,
+  JST, AEST, CET, BST, ...) | IANA names (America/Chicago, Asia/Tokyo, ...)
+  Run --list-timezones for the full list of shortcuts.
+
+record types (--type):
+  EMPTY, RUN_LVL, BOOT_TIME, NEW_TIME, OLD_TIME, INIT_PROCESS,
+  LOGIN_PROCESS, USER_PROCESS (login), DEAD_PROCESS (logout), ACCOUNTING
+
+notes:
+  * On Windows, install the timezone database once for accurate DST:
+        pip install tzdata
+    Without it, shortcuts use a fixed offset (a warning is printed).
+  * Supports Linux wtmp/utmp/btmp (384-byte records). BSD/macOS/Solaris
+    files use a different layout and are not supported.
+"""
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Parse Linux wtmp/utmp/btmp binary files and output readable records.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG,
+    )
+    p.add_argument("input", nargs="?", help="path to wtmp (or utmp/btmp) file")
+    p.add_argument("-o", "--output", help="write to this file instead of the terminal")
+    p.add_argument("-t", "--tz", default="UTC",
+                   help="timezone for timestamps (default: UTC). Use 'epoch' for raw timestamps")
+    p.add_argument("-f", "--format", choices=["text", "csv", "json"], default=None,
+                   help="output format (default: text, or inferred from -o extension)")
+    p.add_argument("--usec", action="store_true", help="include microseconds in timestamps")
+    p.add_argument("--all-fields", action="store_true",
+                   help="include every field (id, session, exit codes, file offset)")
+    p.add_argument("--user", help="only show records for this username")
+    p.add_argument("--type", dest="types", action="append",
+                   help="only show this record type (e.g. USER_PROCESS, BOOT_TIME); repeatable")
+    p.add_argument("--no-empty", action="store_true", help="skip EMPTY records")
+    p.add_argument("--reverse", action="store_true", help="newest first (like the 'last' command)")
+    p.add_argument("--endian", choices=["auto", "little", "big"], default="auto",
+                   help="byte order of source system (default: auto-detect)")
+    p.add_argument("--list-timezones", action="store_true", help="show timezone options and exit")
+    args = p.parse_args()
+
+    if args.list_timezones:
+        list_timezones()
+        return
+    if not args.input:
+        p.print_help()
+        sys.exit(1)
+
+    tz = resolve_timezone(args.tz)
+
+    try:
+        with open(args.input, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        sys.exit(f"error: cannot read '{args.input}': {e}")
+
+    if len(data) < RECORD_SIZE:
+        sys.exit(f"error: file is {len(data)} bytes; smaller than one {RECORD_SIZE}-byte record. "
+                 "Is this a Linux wtmp file?")
+    if len(data) % RECORD_SIZE:
+        print(f"warning: file size {len(data)} is not a multiple of {RECORD_SIZE}; "
+              f"ignoring {len(data) % RECORD_SIZE} trailing bytes (file may be truncated "
+              "or from a non-Linux system).", file=sys.stderr)
+
+    endian = {"little": "<", "big": ">"}.get(args.endian) or detect_endian(data)
+
+    wanted_types = {t.upper() for t in args.types} if args.types else None
+    rows = []
+    for r in parse_wtmp(data, endian):
+        if args.no_empty and r["type_num"] == 0:
+            continue
+        if wanted_types and r["type"] not in wanted_types:
+            continue
+        if args.user and r["user"] != args.user:
+            continue
+        r["time"] = format_time(r["tv_sec"], r["tv_usec"], tz, args.usec)
+        rows.append(r)
+    if args.reverse:
+        rows.reverse()
+
+    fmt = args.format
+    if fmt is None:
+        ext = (args.output or "").lower().rsplit(".", 1)[-1]
+        fmt = ext if ext in ("csv", "json") else "text"
+
+    if fmt == "text":
+        columns = COLUMNS if args.all_fields else TEXT_COLUMNS
+        output = render_text(rows, columns)
+    else:
+        columns = COLUMNS  # CSV/JSON always get every field
+        output = (render_csv if fmt == "csv" else render_json)(rows, columns)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8", newline="") as fh:
+            fh.write(output)
+        print(f"Wrote {len(rows)} records to {args.output}", file=sys.stderr)
+    else:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass
+        sys.stdout.write(output)
+
+
+if __name__ == "__main__":
+    main()
